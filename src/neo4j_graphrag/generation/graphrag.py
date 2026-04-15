@@ -127,6 +127,7 @@ class GraphRAG:
             RagResultModel: The LLM-generated answer.
 
         """
+        # 未来版本将把 return_context 默认改为 True，此处在未显式传入时给出弃用警告并沿用 False
         if return_context is None:
             warnings.warn(
                 "The default value of 'return_context' will change from 'False'"
@@ -135,6 +136,7 @@ class GraphRAG:
             )
             return_context = False
 
+        # 校验搜索参数（问题文本、检索器配置、是否返回上下文、空结果兜底文案等）
         try:
             validated_data = RagSearchModel(
                 query_text=query_text,
@@ -145,15 +147,20 @@ class GraphRAG:
             )
         except ValidationError as e:
             raise SearchValidationError(e.errors())
+        # MessageHistory 需转为与 LLM 一致的 List[LLMMessage] 结构
         if isinstance(message_history, MessageHistory):
             message_history = message_history.messages
+        # 若有历史对话，会先摘要再拼成用于检索的 query；否则检索用语即用户原始 query_text
         query = self._build_query(validated_data.query_text, message_history)
+        # 检索阶段：用上述 query 在图/向量索引中取回相关片段（top_k 等由 retriever_config 传入）
         retriever_result: RetrieverResult = self.retriever.search(
             query_text=query, **validated_data.retriever_config
         )
+        # 无命中且配置了兜底：直接返回固定文案，跳过大模型生成
         if len(retriever_result.items) == 0 and response_fallback is not None:
             answer = response_fallback
         else:
+            # 将检索到的多条内容拼成单一上下文字符串，供提示词模板填充
             context = "\n".join(item.content for item in retriever_result.items)
             prompt = self.prompt_template.format(
                 query_text=query_text, context=context, examples=validated_data.examples
@@ -164,6 +171,7 @@ class GraphRAG:
 
             if self.is_langchain_compatible():
                 # llm interface v2 or langchain chat model
+                # V2 / LangChain：把用户问题、历史与系统指令整理成消息列表再调用
                 messages = legacy_inputs_to_messages(
                     prompt=prompt,
                     message_history=message_history,
@@ -176,6 +184,7 @@ class GraphRAG:
                 )
             elif isinstance(self.llm, LLMInterface):
                 # may have custom LLMs inherited from V1, keep it for backward compatibility
+                # V1：单条 prompt + 可选 message_history 与 system_instruction
                 llm_response = self.llm.invoke(
                     input=prompt,
                     message_history=message_history,
@@ -184,6 +193,7 @@ class GraphRAG:
             else:
                 raise ValueError(f"Type {type(self.llm)} of LLM is not supported.")
             answer = llm_response.content
+        # 组装返回：answer 必填；若需要调试或展示来源，再附上完整检索结果
         result: dict[str, Any] = {"answer": answer}
         if return_context:
             result["retriever_result"] = retriever_result
@@ -200,6 +210,8 @@ class GraphRAG:
             "Summarize the given text in no more than 300 words."
         )
         if message_history:
+            # 多轮场景：先用 LLM 把历史对话压成短摘要，再与当前问题拼成「检索用语」，
+            # 避免直接把长历史丢进向量/全文检索导致噪声或超长
             summarization_prompt = self._chat_summary_prompt(
                 message_history=message_history
             )
@@ -220,6 +232,7 @@ class GraphRAG:
                 raise ValueError(f"Type {type(self.llm)} of LLM is not supported.")
 
             return self.conversation_prompt(summary=summary, current_query=query_text)
+        # 无历史：检索阶段直接使用用户当前问题
         return query_text
 
     def is_langchain_compatible(self) -> bool:
